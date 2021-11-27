@@ -2,13 +2,11 @@
 '''
 Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 SPDX-License-Identifier: MIT-0
-
 Permission is hereby granted, free of charge, to any person obtaining a copy of this
 software and associated documentation files (the "Software"), to deal in the Software
 without restriction, including without limitation the rights to use, copy, modify,
 merge, publish, distribute, sublicense, and/or sell copies of the Software, and to
 permit persons to whom the Software is furnished to do so.
-
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
 INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
 PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
@@ -697,45 +695,245 @@ def check_service_vpc_endpoints(ec2_client, subnets):
     else:
         print("The route for the subnets do not have a NAT Gateway. However, there are sufficient VPC endpoints")
 
-
-def check_routes(input_env, input_subnets, input_subnet_ids, ec2_client):
-    '''
-    method to check and make sure routes have access to the internet if public and subnets are private
-    '''
-    # vpc should be the same so I just took the first one
-    routes = ec2_client.describe_route_tables(Filters=[
+# New functions
+# Function to check Network ACLs
+def check_network_acls(ec2_client, vpc_id, input_subnet_ids):
+    nacls = ec2_client.describe_network_acls(
+        Filters=[
             {
                 'Name': 'vpc-id',
-                'Values': [input_subnets[0]['VpcId']]
+                'Values': [vpc_id]
             },
             {
                 'Name': 'association.subnet-id',
                 'Values': input_subnet_ids
             }
-    ])
-    # check subnets are private
-    print("### Trying to verify if route tables are valid...")
-    for route_table in routes['RouteTables']:
-        has_nat = False
-        for route in route_table['Routes']:
-            if route['State'] == "blackhole":
-                print("Route:", route_table['RouteTableId'], 'has a state of blackhole')
-            if 'GatewayId' in route and route['GatewayId'].startswith('igw'):
-                print('Route:', route_table['RouteTableId'],
-                      'has a route to IGW making the subnet public. Needs to be private', '🚫')
-                print('please review ',
-                      'https://docs.aws.amazon.com/mwaa/latest/userguide/vpc-create.html#vpc-create-required')
-                print("")
-            if 'NatGatewayId' in route:
-                has_nat = True
-        if has_nat:
-            print('Route Table:', route_table['RouteTableId'], 'does have a route to a NAT Gateway', '✅')
-        if not has_nat:
-            print('Route Table:', route_table['RouteTableId'], 'does not have a route to a NAT Gateway')
-            print('checking for VPC endpoints to airflow, s3, sqs, kms, ecr, and monitoring')
-            check_service_vpc_endpoints(ec2_client, input_subnets)
-    print("")
+        ]
+    )['NetworkAcls']
 
+    result = {
+        'ingress': {'final': False, '-1': 'deny', '6': 'deny', '17': 'deny'},
+        'egress': {'final': False, '-1': 'deny', '6': 'deny', '17': 'deny'}
+    }
+    # NACL rules with lowest number take precedence. So, keeping track of last rule number to correctly identify the final result.
+    result['ingress']['previousRule'] = {'-1': 32768, '6': 32768, '17': 32768};
+    result['egress']['previousRule'] = {'-1': 32768, '6': 32768, '17': 32768};
+    for nacl_entry in nacls:
+        for nacl in nacl_entry['Entries']:
+            traffic_type = "egress" if nacl['Egress'] else "ingress"
+            if nacl.get('PortRange'):
+                if nacl['PortRange']['From'] and nacl['PortRange']['To']:
+                    nacl['PortRange'] = nacl['PortRange']['To'] if nacl['PortRange']['From'] == nacl['PortRange']['To'] else nacl['PortRange']['From'] + '-' + nacl['PortRange']['To']
+                else:
+                    nacl['PortRange'] = 'ALL'
+            else:
+                nacl['PortRange'] = 'ALL'
+
+            if nacl['CidrBlock'] == '0.0.0.0/0' and nacl['RuleNumber'] < result[traffic_type]['previousRule'][nacl['Protocol']] and type(nacl['PortRange'] is str):
+                result[traffic_type][nacl['Protocol']] = nacl['RuleAction']
+                result[traffic_type]['previousRule'][nacl['Protocol']] = nacl['RuleNumber']
+
+    for rule_type in ['ingress', 'egress']:
+        if result[rule_type]['-1'] == 'allow' or (result[rule_type]['6'] == 'allow' and result[rule_type['17'] == 'allow']):
+            result[rule_type]['final'] = True
+
+    return True if result['ingress'] and result['egress'] else False
+
+# Function to map subnets and route tables
+def map_subnets_route_tables(route_tables):
+    sub_routes = {}
+    for route_table in route_tables:
+        sub_routes[route_table['RouteTableId']] = route_table['Routes']
+        for association in route_table['Associations']:
+            if association['Main'] == True:
+                sub_routes['main'] = route_table['RouteTableId']
+            else:
+                sub_routes[association['SubnetId']] = route_table['RouteTableId']
+    return sub_routes
+
+# Function to return route entries for requested subnet ID
+def get_subnet_routes(subnet_id, sub_routes):
+    if subnet_id in sub_routes:
+        return sub_routes[sub_routes[subnet_id]]
+    else:
+        return sub_routes[sub_routes['main']]
+
+# Function to check and return default route entry from the specified route table
+def get_default_route(routes):
+    result = {}
+    for route in routes:
+        if route.get('DestinationCidrBlock') == "0.0.0.0/0":
+            result = {
+                "defaultRoute": True,
+                "natGatewayId": route.get('NatGatewayId'),
+                "gatewayId": route.get('GatewayId'),
+                "transitGatewayId": route.get('TransitGatewayId')
+            }
+    return result
+
+# Function to validate if NAT GW has path to Internet
+def validate_nat_gw_path(ec2_client, nat_gw_id, requested_subnet, vpc_routes):
+    # Get the subnet associated with this NAT GW and check its routes
+    nat_subnet_request = ec2_client.describe_nat_gateways(NatGatewayIds=[nat_gw_id])['NatGateways']
+    nat_subnet_id = nat_subnet_request[0]['SubnetId']
+    if nat_subnet_id == requested_subnet:
+        print('NAT Gateway is attached to same subnet. Instead, it should be attached to different i.e. public subnet. 🚫')
+    else:
+        # Different subnet
+        public_route = get_default_route(get_subnet_routes(nat_subnet_id, vpc_routes))
+        if public_route['defaultRoute'] and public_route['gatewayId']:
+            print('NAT GW ({}) has Internet route: {} -> {} -> {} -> {} ✅'.format(nat_gw_id, requested_subnet, nat_gw_id, nat_subnet_id, public_route['gatewayId']))
+        else:
+            print('NAT GW ({}) doesn\'t have Internet route 🚫'.format(nat_gw_id))
+
+# Function to analyze routes via Transit Gateway
+def check_tgw_route(ec2_client, tgw_id, subnet_az):
+    tgw_route_tables = ec2_client.describe_transit_gateway_route_tables(
+        Filters=[
+                    {
+                        'Name': 'transit-gateway-id',
+                        'Values': [tgw_id]
+                    },
+                    {
+                        'Name': 'state',
+                        'Values': ['available']
+                    }
+    ])['TransitGatewayRouteTables']
+    tgw_routes = ec2_client.search_transit_gateway_routes(
+        TransitGatewayRouteTableId=tgw_route_tables[0]['TransitGatewayRouteTableId'],
+        Filters=[
+                {
+                    'Name': 'state',
+                    'Values': ['active']
+                }
+    ])['Routes']
+    for route in tgw_routes:
+        if route['DestinationCidrBlock'] == '0.0.0.0/0':
+            print('{} has default route via {} ({})'.format(tgw_id, route['TransitGatewayAttachments'][0]['ResourceType'], route['TransitGatewayAttachments'][0]['ResourceId']))
+            tgw_attachments = ec2_client.describe_transit_gateway_vpc_attachments(
+                TransitGatewayAttachmentIds=[route['TransitGatewayAttachments'][0]['TransitGatewayAttachmentId']]
+            )['TransitGatewayVpcAttachments']
+            tgw_path_subnets = ec2_client.describe_subnets(SubnetIds=tgw_attachments[0]['SubnetIds'])['Subnets']
+            tgw_az_subnet = [subnet['SubnetId'] for subnet in tgw_path_subnets if subnet['AvailabilityZone'] == subnet_az][0]
+            tgw_egress_vpc_routes = ec2_client.describe_route_tables(Filters=[
+                {
+                    'Name': 'vpc-id',
+                    'Values': [route['TransitGatewayAttachments'][0]['ResourceId']]
+                }
+            ])['RouteTables']
+            tgw_sub_routes = map_subnets_route_tables(tgw_egress_vpc_routes)
+            tgw_subnet_route = get_default_route(get_subnet_routes(tgw_az_subnet, tgw_sub_routes))
+            if tgw_subnet_route['defaultRoute'] and tgw_subnet_route['natGatewayId']:
+                print('TGW has default route to NAT GW ({})'.format(tgw_subnet_route['natGatewayId']))
+                validate_nat_gw_path(ec2_client, tgw_subnet_route['natGatewayId'], tgw_az_subnet, tgw_sub_routes)
+            else:
+                print('TGW doesn\'t have default route to Internet')
+            
+# Function to analyze VPC Endpoints            
+def check_vpc_endpoints(ec2_client, vpc_id, input_subnet_ids, input_security_groups):
+    tld = "com.amazonaws."
+    REGION = 'eu-west-1'
+    service_endpoints = [
+        tld + REGION + '.airflow.api',
+        tld + REGION + '.airflow.env',
+        tld + REGION + '.airflow.ops',
+        tld + REGION + '.sqs',
+        tld + REGION + '.ecr.api',
+        tld + REGION + '.ecr.dkr',
+        tld + REGION + '.kms',
+        tld + REGION + '.s3',
+        tld + REGION + '.monitoring',
+        tld + REGION + '.logs'
+    ]
+    vpc_endpoints = ec2_client.describe_vpc_endpoints(Filters=[
+        {
+            'Name': 'service-name',
+            'Values': service_endpoints
+        },
+        {
+            'Name': 'vpc-id',
+            'Values': [vpc_id]
+        }
+    ])['VpcEndpoints']
+
+    for vpce in vpc_endpoints:
+        if vpce['VpcEndpointType'] == 'Interface':
+            service = '.'.join(vpce['ServiceName'].split('.')[3:]).upper()
+            subnet_match = [subnet_id for subnet_id in vpce['SubnetIds'] if subnet_id in input_subnet_ids]
+            security_group_match = [sg_id['GroupId'] for sg_id in vpce['Groups'] if sg_id['GroupId'] in input_security_groups]
+            # print('{}: {} : {}'.format(service, subnet_match, security_group_match))
+
+            if len(subnet_match) == 0:
+                print('{} VPCE ({}) isn\'t associated with MWAA\'s subnets 🚫'.format(service, vpce['VpcEndpointId']))
+            elif len(subnet_match) == 1:
+                print('{} VPCE ({}) is only associated with one subnet {} 🚫'.format(service, vpce['VpcEndpointId'], subnet_match[0]))
+            
+            if len(subnet_match) >= 1 and len(security_group_match) > 0:
+                print('{} VPCE ({}) has common subnets and security group(s) as MWAA ✅'.format(service, vpce['VpcEndpointId']))
+            elif len(subnet_match) >= 1 and len(security_group_match) == 0:
+                if check_vpce_sg_with_env(ec2_client, input_security_groups, vpce['Groups']):
+                    print('{} VPCE ({}) SG is allowing MWAA environment\'s SG ✅'.format(service, vpce['VpcEndpointId']))
+                else:
+                    print('{} VPCE ({}) doesn\'t share MWAA SG nor allows it. 🚫'.format(service, vpce['VpcEndpointId']))
+            if not vpce['PrivateDnsEnabled']:
+                print('{} VPCE ({}) doesn\'t have Private DNS Enabled. 🚫'.format(service, vpce['VpcEndpointId']))
+
+# Function to check if specified SG allows MWAA
+def check_vpce_sg_with_env(ec2_client, env_sg_ids, vpce_sgs):
+    result = False
+    vcpe_sg_ids = [sg_id['GroupId'] for sg_id in vpce_sgs]
+    groups = ec2_client.describe_security_groups(
+        GroupIds=vcpe_sg_ids
+    )['SecurityGroups']
+    for security_group in groups:
+        for ip_permission in security_group['IpPermissions']:
+            # If allows all traffic or HTTPS from env's SG
+            if ip_permission['IpProtocol'] == '-1' or (ip_permission['IpProtocol'] == 'tcp' and (ip_permission['ToPort'] and (ip_permission['ToPort'] == '443' or (ip_permission['FromPort'] == 0 and ip_permission['ToPort'] == 65535)))):
+                for group_pair in ip_permission['UserIdGroupPairs']:
+                    if group_pair['GroupId'] in env_sg_ids:
+                        result = True
+    return result
+# End of new functions
+
+def check_routes(input_env, input_subnets, input_subnet_ids, ec2_client):
+    '''
+    method to check and make sure routes have access to the internet if public and subnets are private
+    '''
+    print('='*15 + ' Network Analysis ' + '='*15)
+    vpc_id = input_subnets[0]['VpcId']
+    # vpc should be the same so I just took the first one
+    routes = ec2_client.describe_route_tables(Filters=[
+            {
+                'Name': 'vpc-id',
+                'Values': [vpc_id]
+            }
+    ])
+
+    subnet_routes = map_subnets_route_tables(routes['RouteTables'])
+    for subnet_id in input_subnet_ids:
+        subnet_az = [subnet['AvailabilityZone'] for subnet in input_subnets if subnet['SubnetId'] == subnet_id][0]
+        print('Subnet: {} (AZ: {})'.format(subnet_id, subnet_az))
+        if check_network_acls(ec2_client, vpc_id, input_subnet_ids):
+            print('NACL is allowing both ingress and egress. Manually review full NACLs for confirmation.')
+        else:
+            print('NACL isn\'t allowing both ingress and egress. Manually review full NACLs for confirmation.')
+        
+        default_route = get_default_route(get_subnet_routes(subnet_id, subnet_routes))
+        if default_route['defaultRoute'] and default_route['natGatewayId']:
+            validate_nat_gw_path(ec2_client, default_route['natGatewayId'], subnet_id, subnet_routes)
+        elif default_route['defaultRoute'] and default_route['gatewayId']:
+            print('Subnet has default route to {}, so cannot reach Internet 🚫'.format(default_route['gatewayId']))
+        elif default_route['defaultRoute'] and default_route['transitGatewayId']:
+            print('Subnet has default route to {}'.format(default_route['transitGatewayId']))
+            check_tgw_route(ec2_client, default_route['transitGatewayId'], subnet_az)
+        else:
+            print('Subnet has no default route.')
+        print('-'*40)
+
+    # For VPCE Analysis
+    check_vpc_endpoints(ec2_client, vpc_id, input_subnet_ids, input_env['NetworkConfiguration']['SecurityGroupIds'])
+    print('='*15 + ' End of Network Analysis ' + '='*15)
+    print('')
 
 def _check_access_blocked(block_config_type, client, **request_kwargs):
     '''
@@ -975,10 +1173,10 @@ if __name__ == '__main__':
         check_iam_permissions(env, iam)
         check_kms_key_policy(env, kms)
         log_groups = check_log_groups(env, ENV_NAME, logs, cloudtrail)
-        check_nacl(subnets, subnet_ids, ec2)
+        # check_nacl(subnets, subnet_ids, ec2)
         check_routes(env, subnets, subnet_ids, ec2)
         check_s3_block_public_access(env, s3, s3control)
-        check_security_groups(env, ec2)
+        # check_security_groups(env, ec2)
         mwaa_services = get_mwaa_utilized_services(ec2, subnets[0]['VpcId'])
         check_connectivity_to_dep_services(env, subnets, ec2, ssm, mwaa_services)
         check_for_failing_logs(log_groups, logs)
