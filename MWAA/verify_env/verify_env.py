@@ -464,18 +464,7 @@ def check_tgw_route(ec2_client, tgw_id, subnet_az):
 def check_vpc_endpoints(ec2_client, vpc_id, input_subnet_ids, input_security_groups):
     tld = "com.amazonaws."
     REGION = 'eu-west-1'
-    service_endpoints = [
-        tld + REGION + '.airflow.api',
-        tld + REGION + '.airflow.env',
-        tld + REGION + '.airflow.ops',
-        tld + REGION + '.sqs',
-        tld + REGION + '.ecr.api',
-        tld + REGION + '.ecr.dkr',
-        tld + REGION + '.kms',
-        tld + REGION + '.s3',
-        tld + REGION + '.monitoring',
-        tld + REGION + '.logs'
-    ]
+    service_endpoints = [tld + REGION + '.' + srv for srv in ['airflow.api', 'airflow.env', 'airflow.ops', 'sqs', 'ecr.dkr', 'ecr.api', 'kms', 's3', 'monitoring', 'logs']]
     vpc_endpoints = ec2_client.describe_vpc_endpoints(Filters=[
         {
             'Name': 'service-name',
@@ -743,17 +732,9 @@ def print_err_msg(c_err):
 
 def get_mwaa_utilized_services(ec2_client, vpc):
     '''return an array objects for the services checking for ecr.dks and if it exists add it to the array'''
-    top_level_domain = '.amazonaws.com'
-    mwaa_utilized_services = [{"service": 'sqs.' + REGION + top_level_domain, "port": "443"},
-                              {"service": 'api.ecr.' + REGION + top_level_domain, "port": "443"},
-                              {"service": 'monitoring.' + REGION + top_level_domain, "port": "443"},
-                              {"service": 'kms.' + REGION + top_level_domain, "port": "443"},
-                              {"service": 's3.' + REGION + top_level_domain, "port": "443"},
-                              {"service": 'env.airflow.' + REGION + top_level_domain, "port": "443"},
-                              {"service": 'env.airflow.' + REGION + top_level_domain, "port": "5432"},
-                              {"service": 'ops.airflow.' + REGION + top_level_domain, "port": "443"},
-                              {"service": 'api.airflow.' + REGION + top_level_domain, "port": "443"},
-                              {"service": 'logs.' + REGION + top_level_domain, "port": "443"}]
+    tld = '.amazonaws.com'
+    mwaa_srvs = ['api.airflow', 'env.airflow', 'ops.airflow', 'sqs', 'dkr.ecr', 'api.ecr', 'kms', 's3', 'monitoring', 'logs']
+    mwaa_utilized_services = [{"service": srv + '.' + REGION + tld, "port": "443"} for srv in mwaa_srvs]
     ecr_dks_endpoint = ec2_client.describe_vpc_endpoints(Filters=[
         {
             'Name': 'service-name',
@@ -769,7 +750,7 @@ def get_mwaa_utilized_services(ec2_client, vpc):
         }
     ])['VpcEndpoints']
     if ecr_dks_endpoint:
-        mwaa_utilized_services.append({"service": 'dkr.ecr.' + REGION + top_level_domain, "port": "443"})
+        mwaa_utilized_services.append({"service": 'dkr.ecr.' + REGION + tld, "port": "443"})
     return mwaa_utilized_services
 
 
