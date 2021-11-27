@@ -180,298 +180,55 @@ def check_iam_permissions(input_env, iam_client):
         policy_doc = iam_client.get_policy_version(PolicyArn=policy_arn,
                                                    VersionId=policy_version)['PolicyVersion']['Document']
         policy_list.append(json.dumps(policy_doc))
-    eval_results = []
+
     # Add inline policies
     policy_list.extend(get_inline_policies(iam_client, input_env['ExecutionRoleArn'].split("/")[-1]))
-    if "KmsKey" in input_env:
-        print('Found Customer managed CMK')
-        eval_results = eval_results + iam_client.simulate_custom_policy(
+    # Define actions and resources to be simulated
+    actions_resources = [
+        {'actions': ['airflow:PublishMetrics'], 'resources': [input_env['Arn']]},
+        {'actions': ['s3:GetBucket*', 's3:List*'], 'resources': [input_env['SourceBucketArn']]},
+        {'actions': ['s3:GetObject*'], 'resources': [input_env['SourceBucketArn'] +'/*']},
+        {'actions': ['logs:CreateLogStream', 'logs:CreateLogGroup', 'logs:PutLogEvents', 'logs:GetLogEvents', 'logs:GetLogGroupFields'], 'resources': ['arn:aws:logs:'+REGION+':'+account_id+':log-group:airflow-'+input_env['Name'] +'-*']},
+        {'actions': ['logs:DescribeLogGroups'], 'resources': ['*']},
+        {'actions': ['cloudwatch:PutMetricData'], 'resources': ['*']},
+        {'actions': ['sqs:ChangeMessageVisibility', 'sqs:DeleteMessage', 'sqs:GetQueueAttributes', 'sqs:GetQueueUrl', 'sqs:ReceiveMessage', 'sqs:SendMessage'], 'resources': ['arn:aws:sqs:'+REGION+':*:airflow-celery-*']}
+    ]
+    key_resource = input_env['KmsKey'] if "KmsKey" in input_env else 'arn:aws:kms:*:111122223333:key/*'
+
+    # Append KMS actions to the simulation actions list
+    for kms_action in [['kms:GenerateDataKey*'], ['kms:Decrypt', 'kms:Encrypt', 'kms:DescribeKey']]:
+        src_services = ['sqs', 's3'] if "KmsKey" in input_env else ['sqs']
+        for src_service in src_services:
+            actions_resources.append({
+                'actions': kms_action,
+                'resources': [key_resource], 
+                'contextEntries': [
+                    {
+                        'ContextKeyName': 'kms:ViaService',
+                        'ContextKeyValues': [
+                            src_service + '.' + REGION + '.amazonaws.com'
+                        ],
+                        'ContextKeyType': 'string'
+                    }
+                ]
+            })
+    for simulation in actions_resources:
+        eval_results = iam_client.simulate_custom_policy(
             PolicyInputList=policy_list,
-            ActionNames=[
-                "airflow:PublishMetrics"
-            ],
-            ResourceArns=[
-                input_env['Arn']
-            ]
-        )['EvaluationResults']
-        # this next test should be denied
-        eval_results = eval_results + iam_client.simulate_custom_policy(
-            PolicyInputList=policy_list,
-            ActionNames=[
-                "s3:ListAllMyBuckets"
-            ],
-            ResourceArns=[
-                input_env['SourceBucketArn'],
-                input_env['SourceBucketArn'] + '/'
-            ]
-        )['EvaluationResults']
-        eval_results = eval_results + iam_client.simulate_custom_policy(
-            PolicyInputList=policy_list,
-            ActionNames=[
-                "s3:GetObject*",
-                "s3:GetBucket*",
-                "s3:List*"
-            ],
-            ResourceArns=[
-                input_env['SourceBucketArn'],
-                input_env['SourceBucketArn'] + '/'
-            ]
-        )['EvaluationResults']
-        eval_results = eval_results + iam_client.simulate_custom_policy(
-            PolicyInputList=policy_list,
-            ActionNames=[
-                "logs:CreateLogStream",
-                "logs:CreateLogGroup",
-                "logs:PutLogEvents",
-                "logs:GetLogEvents",
-                "logs:GetLogGroupFields"
-            ],
-            ResourceArns=[
-                "arn:aws:logs:" + REGION + ":" + account_id + ":log-group:airflow-" + ENV_NAME + "-*"
-            ]
-        )['EvaluationResults']
-        eval_results = eval_results + iam_client.simulate_custom_policy(
-            PolicyInputList=policy_list,
-            ActionNames=[
-                "logs:DescribeLogGroups"
-            ],
-            ResourceArns=[
-                "*"
-            ]
-        )['EvaluationResults']
-        eval_results = eval_results + iam_client.simulate_custom_policy(
-            PolicyInputList=policy_list,
-            ActionNames=[
-                "cloudwatch:PutMetricData"
-            ],
-            ResourceArns=[
-                "*"
-            ]
-        )['EvaluationResults']
-        eval_results = eval_results + iam_client.simulate_custom_policy(
-            PolicyInputList=policy_list,
-            ActionNames=[
-                "sqs:ChangeMessageVisibility",
-                "sqs:DeleteMessage",
-                "sqs:GetQueueAttributes",
-                "sqs:GetQueueUrl",
-                "sqs:ReceiveMessage",
-                "sqs:SendMessage"
-            ],
-            ResourceArns=[
-                "arn:aws:sqs:" + REGION + ":*:airflow-celery-*"
-            ]
-        )['EvaluationResults']
-        eval_results = eval_results + iam_client.simulate_custom_policy(
-            PolicyInputList=policy_list,
-            ActionNames=[
-                "kms:GenerateDataKey*"
-            ],
-            ResourceArns=[
-                input_env['KmsKey']
-            ],
-            ContextEntries=[
-                {
-                    'ContextKeyName': 'kms:viaservice',
-                    'ContextKeyValues': [
-                        's3.' + REGION + '.amazonaws.com'
-                    ],
-                    'ContextKeyType': 'string'
-                }
-            ],
-        )['EvaluationResults']
-        eval_results = eval_results + iam_client.simulate_custom_policy(
-            PolicyInputList=policy_list,
-            ActionNames=[
-                "kms:GenerateDataKey*"
-            ],
-            ResourceArns=[
-                input_env['KmsKey']
-            ],
-            ContextEntries=[
-                {
-                    'ContextKeyName': 'kms:viaservice',
-                    'ContextKeyValues': [
-                        'sqs.' + REGION + '.amazonaws.com',
-                    ],
-                    'ContextKeyType': 'string'
-                }
-            ],
-        )['EvaluationResults']
-        eval_results = eval_results + iam_client.simulate_custom_policy(
-            PolicyInputList=policy_list,
-            ActionNames=[
-                "kms:Decrypt",
-                "kms:DescribeKey",
-                "kms:Encrypt"
-            ],
-            ResourceArns=[
-                input_env['KmsKey']
-            ],
-            ContextEntries=[
-                {
-                    'ContextKeyName': 'kms:viaservice',
-                    'ContextKeyValues': [
-                        's3.' + REGION + '.amazonaws.com'
-                    ],
-                    'ContextKeyType': 'string'
-                }
-            ],
-        )['EvaluationResults']
-        eval_results = eval_results + iam_client.simulate_custom_policy(
-            PolicyInputList=policy_list,
-            ActionNames=[
-                "kms:Decrypt",
-                "kms:DescribeKey",
-                "kms:Encrypt"
-            ],
-            ResourceArns=[
-                input_env['KmsKey']
-            ],
-            ContextEntries=[
-                {
-                    'ContextKeyName': 'kms:viaservice',
-                    'ContextKeyValues': [
-                        'sqs.' + REGION + '.amazonaws.com'
-                    ],
-                    'ContextKeyType': 'string'
-                }
-            ],
-        )['EvaluationResults']
-    else:
-        print('Using AWS CMK')
-        eval_results = eval_results + iam_client.simulate_custom_policy(
-            PolicyInputList=policy_list,
-            ActionNames=[
-                "airflow:PublishMetrics"
-            ],
-            ResourceArns=[
-                input_env['Arn']
-            ]
-        )['EvaluationResults']
-        # this action should be denied
-        eval_results = eval_results + iam_client.simulate_custom_policy(
-            PolicyInputList=policy_list,
-            ActionNames=[
-                "s3:ListAllMyBuckets"
-            ],
-            ResourceArns=[
-                input_env['SourceBucketArn'],
-                input_env['SourceBucketArn'] + '/'
-            ]
-        )['EvaluationResults']
-        eval_results = eval_results + iam_client.simulate_custom_policy(
-            PolicyInputList=policy_list,
-            ActionNames=[
-                "s3:GetObject*",
-                "s3:GetBucket*",
-                "s3:List*"
-            ],
-            ResourceArns=[
-                input_env['SourceBucketArn'],
-                input_env['SourceBucketArn'] + '/'
-            ]
-        )['EvaluationResults']
-        eval_results = eval_results + iam_client.simulate_custom_policy(
-            PolicyInputList=policy_list,
-            ActionNames=[
-                "logs:CreateLogStream",
-                "logs:CreateLogGroup",
-                "logs:PutLogEvents",
-                "logs:GetLogEvents",
-                "logs:GetLogGroupFields"
-            ],
-            ResourceArns=[
-                "arn:aws:logs:" + REGION + ":" + account_id + ":log-group:airflow-" + ENV_NAME + "-*"
-            ]
-        )['EvaluationResults']
-        eval_results = eval_results + iam_client.simulate_custom_policy(
-            PolicyInputList=policy_list,
-            ActionNames=[
-                "logs:DescribeLogGroups"
-            ],
-            ResourceArns=[
-                "*"
-            ]
-        )['EvaluationResults']
-        eval_results = eval_results + iam_client.simulate_custom_policy(
-            PolicyInputList=policy_list,
-            ActionNames=[
-                "cloudwatch:PutMetricData"
-            ],
-            ResourceArns=[
-                "*"
-            ]
-        )['EvaluationResults']
-        eval_results = eval_results + iam_client.simulate_custom_policy(
-            PolicyInputList=policy_list,
-            ActionNames=[
-                "sqs:ChangeMessageVisibility",
-                "sqs:DeleteMessage",
-                "sqs:GetQueueAttributes",
-                "sqs:GetQueueUrl",
-                "sqs:ReceiveMessage",
-                "sqs:SendMessage"
-            ],
-            ResourceArns=[
-                "arn:aws:sqs:" + REGION + ":*:airflow-celery-*"
-            ]
-        )['EvaluationResults']
-        # tests role to allow any kms all for resources not in this account and that are from the sqs service
-        eval_results = eval_results + iam_client.simulate_custom_policy(
-            PolicyInputList=policy_list,
-            ActionNames=[
-                "kms:Decrypt",
-                "kms:DescribeKey",
-                "kms:Encrypt"
-            ],
-            ResourceArns=[
-                "arn:aws:kms:*:111122223333:key/*"
-            ],
-            ContextEntries=[
-                {
-                    'ContextKeyName': 'kms:viaservice',
-                    'ContextKeyValues': [
-                        'sqs.' + REGION + '.amazonaws.com',
-                    ],
-                    'ContextKeyType': 'string'
-                }
-            ],
-        )['EvaluationResults']
-        eval_results = eval_results + iam_client.simulate_custom_policy(
-            PolicyInputList=policy_list,
-            ActionNames=[
-                "kms:GenerateDataKey*"
-            ],
-            ResourceArns=[
-                "arn:aws:kms:*:111122223333:key/*"
-            ],
-            ContextEntries=[
-                {
-                    'ContextKeyName': 'kms:viaservice',
-                    'ContextKeyValues': [
-                        'sqs.' + REGION + '.amazonaws.com',
-                    ],
-                    'ContextKeyType': 'string'
-                }
-            ],
-        )['EvaluationResults']
-    for eval_result in eval_results:
-        if eval_result['EvalDecision'] != 'allowed' and eval_result['EvalActionName'] == "s3:ListAllMyBuckets":
-            print("Action:", eval_result['EvalActionName'], "is blocked successfully on resource",
-                  eval_result['EvalResourceName'], '✅')
-        elif eval_result['EvalDecision'] != 'allowed':
-            print("Action:", eval_result['EvalActionName'], "is not allowed on resource",
-                  eval_result['EvalResourceName'])
-            print("failed with", eval_result['EvalDecision'], "🚫")
-        elif eval_result['EvalDecision'] == 'allowed' and eval_result['EvalActionName'] == "s3:ListAllMyBuckets":
-            print("Action:", eval_result['EvalActionName'], "is not blocked successfully on resource",
-                  eval_result['EvalResourceName'], '🚫')
-        elif eval_result['EvalDecision'] == 'allowed':
-            print("Action:", eval_result['EvalActionName'], "is allowed on resource",
-                  eval_result['EvalResourceName'], '✅')
-        else:
-            print(eval_result)
+            ActionNames=simulation['actions'],
+            ResourceArns=simulation['resources'],
+            ContextEntries=simulation.get('contextEntries'),
+        )['EvaluationResults'] if simulation.get('contextEntries') else iam_client.simulate_custom_policy(
+                PolicyInputList=policy_list,
+                ActionNames=simulation['actions'],
+                ResourceArns=simulation['resources']
+            )['EvaluationResults']
+        for eval_result in eval_results:
+            if eval_result['EvalDecision'] != 'allowed':
+                print('Action: {} is not allowed on resource {}. Failed with {} 🚫'.format(eval_result['EvalActionName'], eval_result['EvalResourceName'], eval_result['EvalDecision']))
+            else:
+                print('Action: {} is allowed on resource {} ✅'.format(eval_result['EvalActionName'], eval_result['EvalResourceName']))
+
     print('If the policy is denied you can investigate more at ')
     print("https://policysim.aws.amazon.com/home/index.jsp?#roles/" + input_env['ExecutionRoleArn'].split("/")[-1])
     print("")
@@ -568,132 +325,6 @@ def check_log_groups(input_env, env_name, logs_client, cloudtrail_client):
     else:
         print("number of log groups match suggesting they've been created successfully", "✅")
     return loggroups
-
-
-def check_egress_acls(acls, dst_port):
-    '''
-    method to check egress rules and if they allow port 5432. We don't know the destination IP so we ignore cider group
-    taken from
-    https://docs.aws.amazon.com/systems-manager/latest/userguide/automation-awssupport-connectivitytroubleshooter.html
-    '''
-    for acl in acls:
-        # check ipv4 acl rule only
-        if acl.get('CidrBlock'):
-            # Check Port
-            if ((acl.get('Protocol') == '-1') or
-               (dst_port in range(acl['PortRange']['From'], acl['PortRange']['To'] + 1))):
-                # Check Action
-                return acl['RuleAction'] == 'allow'
-    return ""
-
-
-def check_ingress_acls(acls, src_port_from, src_port_to):
-    '''
-    same as check_egress_acls but for ingress
-    '''
-    for acl in acls:
-        # check ipv4 acl rule only
-        if acl.get('CidrBlock'):
-            # Check Port
-            test_range = range(src_port_from, src_port_to)
-            set_test_range = set(test_range)
-            if ((acl.get('Protocol') == '-1') or
-               set_test_range.issubset(range(acl['PortRange']['From'], acl['PortRange']['To'] + 1))):
-                # Check Action
-                return acl['RuleAction'] == 'allow'
-    return ""
-
-
-def check_nacl(input_subnets, input_subnet_ids, ec2_client):
-    '''
-    check to see if the nacls for the subnets have port 5432 if they're even listing any specific ports
-    '''
-    nacls = ec2_client.describe_network_acls(
-        Filters=[
-            {
-                'Name': 'vpc-id',
-                'Values': [input_subnets[0]['VpcId']]
-            },
-            {
-                'Name': 'association.subnet-id',
-                'Values': input_subnet_ids
-            }
-        ]
-    )['NetworkAcls']
-    print("### Trying to verify nACLs on subnets...")
-    for nacl in nacls:
-        egress_acls = [acl for acl in nacl['Entries'] if acl['Egress']]
-        ingress_acls = [acl for acl in nacl['Entries'] if not acl['Egress']]
-        src_egress_check_pass = check_egress_acls(egress_acls, 5432)
-        src_ingress_check_pass = check_ingress_acls(ingress_acls, 5432, 5432)
-        if src_egress_check_pass:
-            print("nacl:", nacl['NetworkAclId'], "allows port 5432 on egress", "✅")
-        else:
-            print("nacl:", nacl['NetworkAclId'], "denied port 5432 on egress", "🚫")
-        if src_ingress_check_pass:
-            print("nacl:", nacl['NetworkAclId'], "allows port 5432 on ingress", "✅")
-        else:
-            print("nacl:", nacl['NetworkAclId'], "denied port 5432 on ingress", "🚫")
-    print("")
-
-
-def check_vpc_endpoint_private_dns_enabled(vpc_endpnts):
-    '''short method to check if the interface's private dns option is set to true'''
-    for vpc_endpnt in vpc_endpnts:
-        if not vpc_endpnt['PrivateDnsEnabled'] and vpc_endpnt['VpcEndpointType'] == 'Interface':
-            print('VPC endpoint:', vpc_endpnt['VpcEndpointId'], "does not have private dns enabled")
-            print('this means that the public dns name for the service will resolve to its public IP and not')
-            print('the vpc endpoint private ip. You should enabled this for use with MWAA')
-
-
-def check_service_vpc_endpoints(ec2_client, subnets):
-    '''
-    should be used if the environment does not have internet access through NAT Gateway
-    '''
-    top_level_domain = "com.amazonaws."
-    service_endpoints = [
-        top_level_domain + REGION + '.airflow.api',
-        top_level_domain + REGION + '.airflow.env',
-        top_level_domain + REGION + '.airflow.ops',
-        top_level_domain + REGION + '.sqs',
-        top_level_domain + REGION + '.ecr.api',
-        top_level_domain + REGION + '.ecr.dkr',
-        top_level_domain + REGION + '.kms',
-        top_level_domain + REGION + '.s3',
-        top_level_domain + REGION + '.monitoring',
-        top_level_domain + REGION + '.logs'
-    ]
-    vpc_endpoints = ec2_client.describe_vpc_endpoints(Filters=[
-        {
-            'Name': 'service-name',
-            'Values': service_endpoints
-        },
-        {
-            'Name': 'vpc-id',
-            'Values': [
-                subnets[0]['VpcId']
-            ]
-        }
-    ])['VpcEndpoints']
-    # filter by subnet ids here, if the vpc endpoints include the env's subnet ids then check those
-    s_ids = [subnet['SubnetId'] for subnet in subnets]
-    vpc_endpoints = [endpoint for endpoint in vpc_endpoints if all(subnet in s_ids for subnet in
-                     endpoint['SubnetIds'])]
-    if len(vpc_endpoints) != 9:
-        print("The route for the subnets do not have a NAT gateway." +
-              "This suggests vpc endpoints are needed to connect to:")
-        print('s3, ecr, kms, sqs, monitoring, airflow.api, airflow.env, airflow.ops')
-        print("The environment's subnets currently have these endpoints: ")
-        for endpoint in vpc_endpoints:
-            print(endpoint['ServiceName'])
-        print("The environment's subnets do not have these endpoints: ")
-        vpc_service_endpoints = [e['ServiceName'] for e in vpc_endpoints]
-        for i, service_endpoint in enumerate(service_endpoints):
-            if service_endpoint not in vpc_service_endpoints:
-                print(service_endpoint)
-        check_vpc_endpoint_private_dns_enabled(vpc_endpoints)
-    else:
-        print("The route for the subnets do not have a NAT Gateway. However, there are sufficient VPC endpoints")
 
 # New functions
 # Function to check Network ACLs
